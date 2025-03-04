@@ -27,10 +27,10 @@ class DilocoSimulatorConfig:
     cosine_anneal: bool = False
     warmup_steps: int = 0
     model_path: Optional[str] = None
-    num_nodes: int = 3  # Trois nœuds : Phone, PC et Server
+    num_nodes: int = 3  # Trois nœuds : Phone, PC, Server
     diloco_interval: int = 500
 
-    # Optimiseur externe pour la synchronisation (ex : entre PC et Server)
+    # Optimiseur externe pour la synchronisation (ex: PC-Server)
     outer_optimizer_cls: Type[torch.optim.Optimizer] = torch.optim.SGD
     outer_optimizer_kwargs: dict = field(default_factory=lambda: {"lr": 0.7, "nesterov": True, "momentum": 0.9})
     
@@ -44,8 +44,8 @@ class DilocoSimulatorConfig:
     
     # Paramètres pour la simulation de connexion
     pc_server_dropout: float = 0.3  # 30% de chance de déconnexion PC-Server
-    simulate_latency: bool = True   # Simule un délai de connexion
-    latency_range: tuple = (0.05, 0.2)  # Délai simulé entre 0.05 et 0.2 secondes pour PC-Server
+    simulate_latency: bool = True   # Simuler la latence
+    latency_range: tuple = (0.05, 0.2)  # Délai entre 50ms et 200ms
     
     # Paramètres pour la simulation de déplacement du véhicule
     initial_vehicle_position: float = 0.0

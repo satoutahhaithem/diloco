@@ -13,12 +13,12 @@ class FederatedCarSystem:
         self.config = DilocoSimulatorConfig()
         
         # Création des modèles pour chaque nœud :
-        # Phone et PC utilisent un modèle léger, le Server un modèle plus puissant.
+        # Le Phone et le PC utilisent un modèle léger, le Server un modèle plus puissant.
         self.phone = CarModel(num_classes)
         self.pc = CarModel(num_classes)
         self.server = ServerModel(num_classes)
         
-        # Initialisation des statistiques de connexion et de latence
+        # Initialisation des statistiques de connexion et latence pour la communication inter-nœuds
         self.connection_stats = {
             'pc_phone': {'success': 0, 'total': 0},
             'pc_server': {'success': 0, 'total': 0, 'latencies': []}
@@ -68,36 +68,60 @@ class FederatedCarSystem:
             if latency is not None:
                 self.connection_stats[connection_type]['latencies'].append(latency)
 
-    def _train_device(self, model, loader, optimizer):
-        """Entraîne le modèle sur l'appareil en traitant les batches du DataLoader."""
+    def _distribute_tasks(self, inputs, distribution):
+        """
+        Divise les indices d'un batch selon la distribution souhaitée.
+        :param inputs: Batch d'inputs.
+        :param distribution: Dictionnaire, par exemple {'server': 0.5, 'pc': 0.3, 'phone': 0.2}.
+        :return: Un dictionnaire de sous-indices pour chaque nœud.
+        """
+        batch_size = inputs.size(0)
+        indices = torch.randperm(batch_size)
+        splits = {}
+        start = 0
+        keys = list(distribution.keys())
+        for i, node in enumerate(keys):
+            if i == len(keys) - 1:
+                count = batch_size - start
+            else:
+                count = int(distribution[node] * batch_size)
+            splits[node] = indices[start:start+count]
+            start += count
+        return splits
+
+    def _train_device(self, model, inputs, labels, optimizer):
+        """
+        Entraîne le modèle sur un sous-batch et retourne la loss, le nombre de bonnes prédictions,
+        le nombre d'échantillons traités et la latence de traitement.
+        """
+        start_time = time.time()
         model.train()
-        total_loss = 0
-        correct = 0
-        for inputs, labels in loader:
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = nn.CrossEntropyLoss()(outputs, labels)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-            _, preds = torch.max(outputs, 1)
-            correct += (preds == labels).sum().item()
-        acc = correct / len(loader.dataset)
-        return total_loss / len(loader), acc
+        outputs = model(inputs)
+        loss = nn.CrossEntropyLoss()(outputs, labels)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        end_time = time.time()
+        elapsed = end_time - start_time
+        _, preds = torch.max(outputs, 1)
+        correct = (preds == labels).sum().item()
+        return loss.item() * inputs.size(0), correct, inputs.size(0), elapsed
 
     def _simulate_pc_server_connection(self):
         """
-        Simule la connexion entre le PC et le serveur.
-        La probabilité de réussite dépend de la position du véhicule :
-          - En zone blanche (position >= 50), la déconnexion est plus probable.
-          - Sinon, la connexion est plus fiable.
+        Simule la connexion entre le PC et le serveur en fonction de la position du véhicule.
+        - Position < 40: bonne couverture (faible probabilité d'échec)
+        - 40 <= Position < 60: zone grise (probabilité intermédiaire)
+        - Position >= 60: faible couverture (forte probabilité d'échec)
         La latence est simulée si activée.
         """
-        if self.vehicle_position >= 50.0:
-            dynamic_dropout = 0.8  # 80% de chance d'échec en zone blanche
+        if self.vehicle_position < 40.0:
+            dynamic_dropout = 0.1  # 10% de chance d'échec
+        elif self.vehicle_position < 60.0:
+            dynamic_dropout = 0.5  # 50% de chance d'échec (zone grise)
         else:
-            dynamic_dropout = 0.1  # 10% de chance d'échec en zone de bonne couverture
-        
+            dynamic_dropout = 0.8  # 80% de chance d'échec
+
         start_time = time.time()
         if self.config.simulate_latency:
             simulated_delay = random.uniform(*self.config.latency_range)
@@ -106,57 +130,109 @@ class FederatedCarSystem:
         elapsed_time = time.time() - start_time
         return connection_success, elapsed_time
 
+
     def _update_vehicle_position(self):
         """
         Met à jour la position du véhicule en fonction de sa vitesse.
-        La position est cyclique : lorsque le véhicule atteint la fin de la route,
-        il recommence au début.
+        La position est cyclique : quand le véhicule atteint la fin, il recommence.
         """
         self.vehicle_position = (self.vehicle_position + self.velocity) % self.road_length
 
     def run_training(self):
-        """Boucle d'entraînement principale orchestrant la synchronisation et l'entraînement des modèles."""
+        """
+        Boucle d'entraînement principale qui orchestre la répartition des tâches, la synchronisation et l'entraînement.
+        Calcule et affiche les métriques globales de performance (loss, accuracy, samples et latence moyenne) pour l'ensemble du cluster.
+        """
         train_loader = DataLoader(self.train_data, batch_size=self.config.batch_size, shuffle=True)
         phone_optim = optim.SGD(self.phone.parameters(), lr=0.01, momentum=0.9)
         pc_optim = optim.SGD(self.pc.parameters(), lr=0.01, momentum=0.9)
         server_optim = optim.Adam(self.server.parameters(), lr=0.001)
         
         for epoch in range(self.config.num_epochs):
-            # Mise à jour de la position du véhicule
             self._update_vehicle_position()
-            print(f"Position du véhicule: {self.vehicle_position:.2f}")
+            print(f"\nPosition du véhicule: {self.vehicle_position:.2f}")
             
-            # Synchronisation PC-Phone : toujours réussie
-            self._aggregate_models(self.phone, self.pc)
-            self._log_connection('pc_phone', True)
-            
-            # Entraînement local sur chaque appareil
-            phone_loss, phone_acc = self._train_device(self.phone, train_loader, phone_optim)
-            pc_loss, pc_acc = self._train_device(self.pc, train_loader, pc_optim)
-            server_loss, server_acc = self._train_device(self.server, train_loader, server_optim)
-            
-            # Simulation de la connexion PC-Server en fonction de la position
-            success, latency = self._simulate_pc_server_connection()
-            if success:
-                self._aggregate_models(self.pc, self.server)
+            # Détermination de la répartition en fonction de la connectivité PC-Server
+            connectivity, comm_latency = self._simulate_pc_server_connection()
+            if connectivity:
+                distribution = {'server': 0.5, 'pc': 0.3, 'phone': 0.2}
                 pc_server_status = "✓"
-                self._log_connection('pc_server', True, latency)
+                self._log_connection('pc_server', True, comm_latency)
             else:
+                distribution = {'pc': 0.6, 'phone': 0.4}  # Le serveur n'est pas utilisé
                 pc_server_status = "✗"
                 self._log_connection('pc_server', False)
             
-            # Affichage des résultats pour l'époque en cours
+            # Synchronisation PC-Phone (toujours réussie)
+            self._aggregate_models(self.phone, self.pc)
+            self._log_connection('pc_phone', True)
+            
+            # Initialisation des accumulateurs de métriques pour l'époque
+            phone_total_loss = 0.0; phone_correct = 0; phone_samples = 0; phone_latency = 0.0
+            pc_total_loss = 0.0; pc_correct = 0; pc_samples = 0; pc_latency = 0.0
+            server_total_loss = 0.0; server_correct = 0; server_samples = 0; server_latency = 0.0
+            
+            for inputs, labels in train_loader:
+                splits = self._distribute_tasks(inputs, distribution)
+                
+                if 'phone' in splits and splits['phone'].numel() > 0:
+                    phone_inputs = inputs[splits['phone']]
+                    phone_labels = labels[splits['phone']]
+                    loss_val, correct_val, n_samples, lat = self._train_device(self.phone, phone_inputs, phone_labels, phone_optim)
+                    phone_total_loss += loss_val
+                    phone_correct += correct_val
+                    phone_samples += n_samples
+                    phone_latency += lat
+                
+                if 'pc' in splits and splits['pc'].numel() > 0:
+                    pc_inputs = inputs[splits['pc']]
+                    pc_labels = labels[splits['pc']]
+                    loss_val, correct_val, n_samples, lat = self._train_device(self.pc, pc_inputs, pc_labels, pc_optim)
+                    pc_total_loss += loss_val
+                    pc_correct += correct_val
+                    pc_samples += n_samples
+                    pc_latency += lat
+                
+                if 'server' in splits and splits.get('server') is not None and splits['server'].numel() > 0:
+                    server_inputs = inputs[splits['server']]
+                    server_labels = labels[splits['server']]
+                    loss_val, correct_val, n_samples, lat = self._train_device(self.server, server_inputs, server_labels, server_optim)
+                    server_total_loss += loss_val
+                    server_correct += correct_val
+                    server_samples += n_samples
+                    server_latency += lat
+            
+            # Calcul des métriques par nœud
+            phone_loss_avg = phone_total_loss / phone_samples if phone_samples > 0 else 0
+            phone_acc = phone_correct / phone_samples if phone_samples > 0 else 0
+            phone_latency_avg = phone_latency / (phone_samples / self.config.batch_size) if phone_samples > 0 else 0
+
+            pc_loss_avg = pc_total_loss / pc_samples if pc_samples > 0 else 0
+            pc_acc = pc_correct / pc_samples if pc_samples > 0 else 0
+            pc_latency_avg = pc_latency / (pc_samples / self.config.batch_size) if pc_samples > 0 else 0
+
+            server_loss_avg = server_total_loss / server_samples if server_samples > 0 else 0
+            server_acc = server_correct / server_samples if server_samples > 0 else 0
+            server_latency_avg = server_latency / (server_samples / self.config.batch_size) if server_samples > 0 else 0
+            
+            # Calcul des métriques globales pondérées
+            total_samples = phone_samples + pc_samples + server_samples
+            global_loss = (phone_total_loss + pc_total_loss + server_total_loss) / total_samples if total_samples > 0 else 0
+            global_correct = phone_correct + pc_correct + server_correct
+            global_acc = global_correct / total_samples if total_samples > 0 else 0
+            
+            # Affichage des métriques de l'époque
             print(f"\nEpoch {epoch+1}/{self.config.num_epochs}")
-            print("┌──────────────────────┬──────────────────────┐")
-            print(f"│ PC-Phone Connection  │       ✓          │")
-            print(f"│ PC-Server Connection │       {pc_server_status}          │")
-            print("└──────────────────────┴──────────────────────┘")
-            print(f"Phone Model │ Loss: {phone_loss:.4f} │ Accuracy: {phone_acc:.2%}")
-            print(f"PC Model    │ Loss: {pc_loss:.4f} │ Accuracy: {pc_acc:.2%}")
-            print(f"Server Model│ Loss: {server_loss:.4f} │ Accuracy: {server_acc:.2%}")
+            print("┌─────────────────────────────┬─────────────────────────────┐")
+            print(f"│ PC-Phone Connection         │       ✓                     │")
+            print(f"│ PC-Server Connection        │       {pc_server_status}                     │")
+            print("└─────────────────────────────┴─────────────────────────────┘")
+            print(f"Phone Model    : Loss: {phone_loss_avg:.4f}, Accuracy: {phone_acc:.2%}, Samples: {phone_samples}, Latency: {phone_latency_avg:.3f}s")
+            print(f"PC Model       : Loss: {pc_loss_avg:.4f}, Accuracy: {pc_acc:.2%}, Samples: {pc_samples}, Latency: {pc_latency_avg:.3f}s")
+            print(f"Server Model   : Loss: {server_loss_avg:.4f}, Accuracy: {server_acc:.2%}, Samples: {server_samples}, Latency: {server_latency_avg:.3f}s")
+            print(f"Global Cluster : Loss: {global_loss:.4f}, Accuracy: {global_acc:.2%}, Samples: {total_samples}")
             print("─" * 50)
         
-        # Rapport final de qualité de service
         print("\n=== Rapport Final de Connectivité ===")
         print(f"Connexions PC-Phone réussies: {self.connection_stats['pc_phone']['success']}/{self.connection_stats['pc_phone']['total']}")
         print(f"Connexions PC-Serveur réussies: {self.connection_stats['pc_server']['success']}/{self.connection_stats['pc_server']['total']}")
@@ -211,3 +287,4 @@ class ServerModel(nn.Module):
     def forward(self, x):
         x = self.features(x)
         return self.classifier(x.view(x.size(0), -1))
+# exo , mon trvavail, exo gym 
